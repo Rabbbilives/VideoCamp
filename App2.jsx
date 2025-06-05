@@ -1,21 +1,22 @@
+// App.js (extended to extract audio and save to IndexedDB)
 import React, { useEffect, useRef, useState } from 'react';
-
+import { saveToIndexedDB, getAllRecordings, deleteRecording as deleteFromDB } from './db';
 
 function App() {
   const videoRef = useRef(null);
   const mediaRecorderRef = useRef(null);
-  const recognitionRef = useRef(null);
   const chunksRef = useRef([]);
+  const recognitionRef = useRef(null);
   const [recording, setRecording] = useState(false);
   const [transcript, setTranscript] = useState('');
   const [recordedVideoUrl, setRecordedVideoUrl] = useState(null);
   const [recordings, setRecordings] = useState([]);
-  const [namePrompt, setNamePrompt] = useState('');
-
 
   useEffect(() => {
-    const saved = JSON.parse(localStorage.getItem('recordings')) || [];
-    setRecordings(saved);
+    (async () => {
+      const saved = await getAllRecordings();
+      setRecordings(saved);
+    })();
   }, []);
 
   useEffect(() => {
@@ -28,31 +29,26 @@ function App() {
           chunksRef.current.push(e.data);
         };
 
-        mediaRecorderRef.current.onstop = () => {
+        mediaRecorderRef.current.onstop = async () => {
           const blob = new Blob(chunksRef.current, { type: 'video/webm' });
           const url = URL.createObjectURL(blob);
           setRecordedVideoUrl(url);
 
-          // Ask for name
+          const audioBlob = await extractAudio(blob);
+
           const newName = prompt("Enter a name for this recording:") || `Untitled ${Date.now()}`;
 
-          const newEntry = { name: newName, url, transcript };
-          let updated = [newEntry, ...recordings];
+          await saveToIndexedDB(newName, audioBlob, transcript);
 
-          if (updated.length > 5) updated = updated.slice(0, 5);
-
+          const updated = await getAllRecordings();
           setRecordings(updated);
-          localStorage.setItem('recordings', JSON.stringify(updated));
 
-          // Optional: auto-download
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = `${newName}.webm`;
-          a.click();
+          // Cleanup memory
+          chunksRef.current = [];
         };
       })
       .catch((err) => alert('Camera error: ' + err.message));
-  }, [recordings, transcript]);
+  }, []);
 
   const startRecognition = () => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -90,6 +86,10 @@ function App() {
     chunksRef.current = [];
     mediaRecorderRef.current.start();
     startRecognition();
+
+    setTimeout(() => {
+      if (recording) handleStop();
+    }, 10 * 60 * 1000); // 10 minutes
   };
 
   const handleStop = () => {
@@ -98,34 +98,44 @@ function App() {
     stopRecognition();
   };
 
-  const handleDelete = (index) => {
-    const updated = [...recordings];
-    updated.splice(index, 1);
+  const handleDelete = async (id) => {
+    await deleteFromDB(id);
+    const updated = await getAllRecordings();
     setRecordings(updated);
-    localStorage.setItem('recordings', JSON.stringify(updated));
   };
 
-  const handleReRecord = () => {
-    setTranscript('');
-    setRecordedVideoUrl(null);
-    setNamePrompt('');
-  };
+  async function extractAudio(videoBlob) {
+    const arrayBuffer = await videoBlob.arrayBuffer();
+    const context = new AudioContext();
+    const audioBuffer = await context.decodeAudioData(arrayBuffer);
+    const dest = context.createMediaStreamDestination();
+    const source = context.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(dest);
+    source.start();
+
+    const mediaRecorder = new MediaRecorder(dest.stream);
+    const audioChunks = [];
+    return new Promise((resolve) => {
+      mediaRecorder.ondataavailable = (event) => audioChunks.push(event.data);
+      mediaRecorder.onstop = () => resolve(new Blob(audioChunks, { type: 'audio/webm' }));
+      mediaRecorder.start();
+      setTimeout(() => mediaRecorder.stop(), audioBuffer.duration * 1000);
+    });
+  }
 
   return (
     <div style={{ padding: '20px', fontFamily: 'sans-serif' }}>
-      <h1>🎥 Record + Transcript (Limit 5)</h1>
+      <h1>🎥 Record + Transcript (10 min max)</h1>
       <video ref={videoRef} autoPlay muted style={{ width: '100%', maxWidth: '600px', borderRadius: '8px' }} />
 
       <div style={{ marginTop: '10px' }}>
         <button onClick={handleStart} disabled={recording}>Start</button>
         <button onClick={handleStop} disabled={!recording} style={{ marginLeft: '10px' }}>Stop</button>
-        <button onClick={handleReRecord} style={{ marginLeft: '10px' }}>Re-record</button>
       </div>
 
       <h3 style={{ marginTop: '20px' }}>📝 Transcript:</h3>
-      <div style={{ background: '#f9f9f9', padding: '10px', minHeight: '80px' }}>
-        {transcript || '...waiting for speech...'}
-      </div>
+      <div style={{ background: '#f9f9f9', padding: '10px', minHeight: '80px' }}>{transcript || '...waiting for speech...'}</div>
 
       {recordedVideoUrl && (
         <>
@@ -134,15 +144,15 @@ function App() {
         </>
       )}
 
-      <h3 style={{ marginTop: '30px' }}>📂 Past Recordings:</h3>
+      <h3 style={{ marginTop: '30px' }}>📂 Past Recordings (from IndexedDB):</h3>
       {recordings.length === 0 && <p>No saved recordings yet.</p>}
-      {recordings.map((rec, i) => (
-        <div key={i} style={{ marginBottom: '20px', padding: '10px', background: '#eee', borderRadius: '8px' }}>
+      {recordings.map((rec) => (
+        <div key={rec.id} style={{ marginBottom: '20px', padding: '10px', background: '#eee', borderRadius: '8px' }}>
           <strong>📛 {rec.name}</strong>
           <br />
-          <video controls src={rec.url} style={{ width: '100%', maxWidth: '500px', marginTop: '8px' }} />
+          <audio controls src={URL.createObjectURL(rec.blob)} style={{ marginTop: '8px' }} />
           <p><strong>📝 Transcript:</strong> {rec.transcript}</p>
-          <button onClick={() => handleDelete(i)} style={{ background: 'red', color: 'white' }}>Delete</button>
+          <button onClick={() => handleDelete(rec.id)} style={{ background: 'red', color: 'white' }}>Delete</button>
         </div>
       ))}
     </div>
@@ -150,4 +160,3 @@ function App() {
 }
 
 export default App;
-
